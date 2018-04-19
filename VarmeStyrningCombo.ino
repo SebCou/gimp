@@ -16,6 +16,7 @@
 #define Serialprintln Serial.println
 #define Serialwrite Serial.write
 
+
 //     RFM 01 Define section
 #define RF_PORT	PORTD
 #define RF_DDR	DDRD
@@ -193,18 +194,18 @@ Adafruit_DCMotor *myMotor = AFMS.getMotor(1);
 #define SHUNT_OPEN_END  0x01
 #define SHUNT_CLOSE_END 0x02
 #define ADJUSTMENT_PERIOD 2*60*1000UL
-byte end_point;
 int end_point_count = 0;
 int movement_count = 0;
+byte drive_cnt;
 
 // End SHUNT define section
 
 
 // END End sensor define section
-#define END_IN 9
-#define END_IN_RAW PINB1
 #define END_IN_PIN PINB
+#define AT_ENDPOINT (!(END_IN_PIN & B00000010))
 // END End sensor define section
+
 
 void software_Reboot()
 {
@@ -218,6 +219,7 @@ Watchdog::CApplicationMonitor ApplicationMonitor;
 
 #define SETTEMP_ADR  0
 #define END_POINT_ADR 1
+#define DRIVE_CNT_ADR 2
 
 void setup() {
   Serial.begin(9600);
@@ -234,35 +236,12 @@ void setup() {
     Serialprint(F("Set temp: "));
     Serialprintln(temp);    
   }
-
-  if(END_IN_PIN & B00000010)
-  {
-    Serialprint(F("Binary 1"));
-  }
-  else
-  {
-    Serialprint(F("Binary 0"));
-  }
   
-
-  end_point = SHUNT_NORMAL;
-  temp = EEPROM.read(END_POINT_ADR);
-  if(temp == SHUNT_OPEN_END || temp == SHUNT_CLOSE_END)
-  {
-    if (!(END_IN_PIN & B00000010))
-    {
-      end_point = temp;
-    }
-    else
-    {
-      //Clear endpoint
-      EEPROM.write(END_POINT_ADR, end_point);
-    }
-  }
-    
-    Serialprint(F("Shunt state: "));
-    Serialprintln(end_point);
-  
+  drive_cnt = 0;
+  temp = EEPROM.read(DRIVE_CNT_ADR);
+  temp = constrain(temp,0,8);
+  drive_cnt = temp;
+  EEPROM.write(DRIVE_CNT_ADR, drive_cnt);  
 
   //Init powermeter receiver
   rf01_init();
@@ -374,62 +353,51 @@ void adjust_shunt(void)
     //is it within tolerance then return without action
     if(fabs(diff) < 2.0)
       return;
-
-    //if for any reason we are not in an end-point. Lets clear the flag
-    
-    if( (end_point != SHUNT_NORMAL) && (END_IN_PIN & B00000010))
+      
+    //switch goes high at endpoint
+    //handle endpoint case
+    if( AT_ENDPOINT ) 
     {
-        end_point = SHUNT_NORMAL;
-        EEPROM.write(END_POINT_ADR, end_point);
-    }
-    
-    //is end-point reached?
-    if(end_point != SHUNT_NORMAL)
-    {
-      if( (end_point == SHUNT_OPEN_END && diff > 0) || (end_point == SHUNT_CLOSE_END && diff < 0)  )
+      Serialprintln(F("At endpoint!"));
+      if (celsius > 40 && diff > 0 )
       {
-        Serialprintln(F("At endpoint!"));
+        Serialprintln(F("Fully open, cannot increase!"));
+        return;
+      }     
+      if (celsius <= 40 && diff < 0 )
+      {
+        Serialprintln(F("Fully closed, cannot decrease!"));
         return;
       } 
-      else
+      //special case - shunt is fully open but heat is down
+      if (celsius <= 40 && diff > 0 && drive_cnt == 8 )
       {
-        if(diff > 0)
-        {
-          //open shunt
-          myMotor->run(FORWARD);
-        }
-        else
-        {
-          myMotor->run(BACKWARD);
-          //close shunt
-        }
-        //drive the shunt until we are clear of the endpoint
-        while(!(END_IN_PIN & B00000010))
-        { 
-        }
-        delay(200);  //run for a while longer to make sure we avoid hysteresis
-        //Clear the end_point!
-        end_point = SHUNT_NORMAL;
-        EEPROM.write(END_POINT_ADR, end_point);
-      }
-    }
+        Serialprintln(F("Heat delivery discountinued, fully open, cannot increase!"));
+        return;
+      }     
+    } 
+
+    //safe to drive motor
     if(diff > 0)
     {
       //open shunt
       myMotor->run(FORWARD);
+      drive_cnt++;
     }
     else
     {
       myMotor->run(BACKWARD);
+      drive_cnt--;
       //close shunt
     }
+    drive_cnt = constrain(drive_cnt,0,8);
+    EEPROM.update(DRIVE_CNT_ADR, drive_cnt);
+    
     for(i=0;i<5;i++)
      {
       delay(50);
-      if(!(END_IN_PIN & B00000010))
+      if(AT_ENDPOINT)
       {
-        end_point = (diff > 0) ? SHUNT_OPEN_END : SHUNT_CLOSE_END;
-        EEPROM.write(END_POINT_ADR, end_point);
         Serialprintln(F("End point reached!"));
         end_point_count++;
         break;  //break will break the nearest loop, in this case the for loop
@@ -549,19 +517,14 @@ void process_client(void)
             client.print(F("Set Temperature: "));
             client.print( bor_temp, 1);
             client.println("<br />");
-            client.print(F("Shunt state: "));
-            switch(end_point)
-            {
-            case SHUNT_NORMAL:
+            client.print(F("Drive count: "));
+            client.print( drive_cnt, 1);
+            client.println("<br />");
+            client.print(F("End point detector: "));
+            if AT_ENDPOINT
+              client.print("AT ENDPOINT");
+            else
               client.print("NORMAL");
-              break;              
-            case SHUNT_OPEN_END:
-              client.print("FULLY OPEN");
-              break;              
-            case SHUNT_CLOSE_END:
-              client.print("CLOSED");
-              break;              
-            } 
             client.println("<br />");
             client.print(F("Movement/End point count: "));
             client.print( movement_count);
